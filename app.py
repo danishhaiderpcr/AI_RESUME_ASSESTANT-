@@ -25,7 +25,9 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
+# Tried in order if the selected model returns 404 (retired / not available).
+FALLBACK_MODELS = ["gemini-flash-latest", "gemini-2.5-flash"]
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 30_000
 MAX_JD_CHARS = 10_000
@@ -203,12 +205,30 @@ def analyze_resume(
     job_description: str = "",
     max_attempts: int = 3,
 ) -> ATSReport:
+    """Analyze a resume. If the model is gone (404), try the fallback models."""
     client = genai.Client(api_key=api_key)
     checks = run_basic_checks(resume_text)
     prompt = build_prompt(
         resume_text[:MAX_RESUME_CHARS], job_description[:MAX_JD_CHARS], checks
     )
 
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    for i, candidate in enumerate(candidates):
+        try:
+            report = _analyze_with_model(client, candidate, prompt, max_attempts)
+            break
+        except genai_errors.APIError as exc:
+            if getattr(exc, "code", None) == 404 and i < len(candidates) - 1:
+                continue  # model retired or unavailable: try the next one
+            raise
+
+    report.overall_score = _clamp(report.overall_score)
+    for cat in report.category_scores:
+        cat.score = _clamp(cat.score)
+    return report
+
+
+def _analyze_with_model(client, model: str, prompt: str, max_attempts: int) -> ATSReport:
     config_kwargs = dict(
         system_instruction=SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
@@ -243,9 +263,6 @@ def analyze_resume(
     else:  # pragma: no cover - loop always breaks or raises
         raise RuntimeError(f"Analysis failed: {last_error}")
 
-    report.overall_score = _clamp(report.overall_score)
-    for cat in report.category_scores:
-        cat.score = _clamp(cat.score)
     return report
 
 
